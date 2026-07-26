@@ -10,10 +10,17 @@ APP="dist/${APP_NAME}.app"
 rm -rf "$BUILD" dist
 mkdir -p "$BUILD" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-echo "==> 编译 Swift 源码"
+echo "==> 编译 Swift 源码（Universal：arm64 + x86_64）"
 swiftc -O -swift-version 5 -parse-as-library \
-    -o "$APP/Contents/MacOS/ProxyLauncher" \
+    -target arm64-apple-macos13 \
+    -o "$BUILD/ProxyLauncher-arm64" \
     Sources/main.swift
+swiftc -O -swift-version 5 -parse-as-library \
+    -target x86_64-apple-macos13 \
+    -o "$BUILD/ProxyLauncher-x86_64" \
+    Sources/main.swift
+lipo -create -output "$APP/Contents/MacOS/ProxyLauncher" \
+    "$BUILD/ProxyLauncher-arm64" "$BUILD/ProxyLauncher-x86_64"
 
 echo "==> 生成图标"
 swift make-icon.swift "$BUILD/icon-1024.png"

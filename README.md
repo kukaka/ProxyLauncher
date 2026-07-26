@@ -1,10 +1,26 @@
 # 代理启动器（ProxyLauncher）
 
+> 本项目已链接认可 [LINUX DO](https://linux.do) 社区。
+
 一个 macOS 原生小工具：设置好代理地址后，把应用添加进列表，从这里启动的应用会自动注入
 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` 环境变量，让 Antigravity、Claude
 等应用的后台进程（如 language_server）直接走 Clash 本地端口，**无需开启 TUN 模式**。
 
-原理来自《MacBook 代理启动 Antigravity.md》：应用启动前注入标准代理环境变量。
+原理：应用启动前注入标准代理环境变量，只影响被启动的应用，不修改系统全局代理。
+
+## 下载安装
+
+从 [Releases](https://github.com/ZhjGo/ProxyLauncher/releases) 下载最新的
+`ProxyLauncher-x.x.zip`，解压后把 `代理启动器.app` 拖进「应用程序」文件夹。
+支持 Apple Silicon 和 Intel（Universal），需要 macOS 13 或更高。
+
+**首次打开**：本应用没有 Apple 开发者签名，直接双击会提示"无法验证开发者"。
+解决方法（任选其一）：
+
+- 打开「系统设置 → 隐私与安全性」，在底部找到被拦截的提示，点「仍要打开」；
+- 或在终端执行：`xattr -cr /Applications/代理启动器.app`，之后正常双击即可。
+
+不想用现成包的话，克隆仓库跑 `./build.sh` 自己构建（只需 Xcode 命令行工具）。
 
 ## 使用
 
