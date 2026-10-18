@@ -10,17 +10,11 @@ APP="dist/${APP_NAME}.app"
 rm -rf "$BUILD" dist
 mkdir -p "$BUILD" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-echo "==> 编译 Swift 源码（Universal：arm64 + x86_64）"
+echo "==> 编译 Swift 源码（Apple Silicon：arm64）"
 swiftc -O -swift-version 5 -parse-as-library \
     -target arm64-apple-macos13 \
-    -o "$BUILD/ProxyLauncher-arm64" \
+    -o "$APP/Contents/MacOS/ProxyLauncher" \
     Sources/main.swift
-swiftc -O -swift-version 5 -parse-as-library \
-    -target x86_64-apple-macos13 \
-    -o "$BUILD/ProxyLauncher-x86_64" \
-    Sources/main.swift
-lipo -create -output "$APP/Contents/MacOS/ProxyLauncher" \
-    "$BUILD/ProxyLauncher-arm64" "$BUILD/ProxyLauncher-x86_64"
 
 echo "==> 生成图标"
 swift make-icon.swift "$BUILD/icon-1024.png"
@@ -37,5 +31,11 @@ cp Info.plist "$APP/Contents/Info.plist"
 
 echo "==> 签名（本机 ad-hoc）"
 codesign --force --deep -s - "$APP"
+codesign --verify --deep --strict "$APP"
+
+VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.plist)
+ARCHIVE="dist/ProxyLauncher-${VERSION}-arm64.zip"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"
 
 echo "==> 完成：$PWD/$APP"
+echo "==> 安装包：$PWD/$ARCHIVE"

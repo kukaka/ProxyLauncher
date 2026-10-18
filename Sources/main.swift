@@ -9,6 +9,26 @@ import UniformTypeIdentifiers
 struct ManagedApp: Identifiable, Codable, Equatable {
     var id: UUID = UUID()
     var path: String
+    var injectProxyEnvironment = true
+    var chromiumProxyEnabled = false
+
+    init(path: String) { self.path = path }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, path, injectProxyEnvironment, chromiumProxyEnabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        path = try values.decode(String.self, forKey: .path)
+        injectProxyEnvironment = try values.decodeIfPresent(Bool.self, forKey: .injectProxyEnvironment) ?? true
+        chromiumProxyEnabled = try values.decodeIfPresent(Bool.self, forKey: .chromiumProxyEnabled) ?? false
+    }
+
+    func launchArguments(proxyURL: String) -> [String] {
+        chromiumProxyEnabled ? ["--proxy-server=\(proxyURL)"] : []
+    }
 
     var name: String {
         FileManager.default.displayName(atPath: path)
@@ -36,6 +56,7 @@ final class AppState: ObservableObject {
     @Published var exitChecking = false
     @Published var exitInfo: String? = nil
     @Published var scanning = false
+    @Published var launchSettingsSuggestion: ManagedApp?
 
     private let defaults = UserDefaults.standard
 
@@ -331,7 +352,11 @@ final class AppState: ObservableObject {
         guard path.hasSuffix(".app"),
               path != Bundle.main.bundlePath,
               !apps.contains(where: { $0.path == path }) else { return }
-        apps.append(ManagedApp(path: path))
+        let app = ManagedApp(path: path)
+        apps.append(app)
+        if URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent.lowercased() == "chatgpt" {
+            DispatchQueue.main.async { self.launchSettingsSuggestion = app }
+        }
     }
 
     func addApps() {
@@ -408,8 +433,11 @@ final class AppState: ObservableObject {
         }
         let config = NSWorkspace.OpenConfiguration()
         var env = ProcessInfo.processInfo.environment
-        proxyEnvironment.forEach { env[$0] = $1 }
+        if app.injectProxyEnvironment {
+            proxyEnvironment.forEach { env[$0] = $1 }
+        }
         config.environment = env
+        config.arguments = app.launchArguments(proxyURL: proxyURL)
         config.createsNewApplicationInstance = false
         let name = app.name
         NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: app.path),
@@ -426,9 +454,18 @@ final class AppState: ObservableObject {
     }
 
     func copyTerminalCommand(_ app: ManagedApp) {
-        let envs = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
-            .map { "\($0)=\"\(proxyURL)\"" }.joined(separator: " ")
-        let cmd = "\(envs) NO_PROXY=\"\(noProxy)\" open -a \"\(app.path)\""
+        guard let executable = Bundle(path: app.path)?.executableURL?.path else {
+            showToast("读取应用启动信息失败")
+            return
+        }
+        var parts: [String] = []
+        if app.injectProxyEnvironment {
+            parts = ["env"] + proxyEnvironment.keys.sorted().map {
+                shellQuote("\($0)=\(proxyEnvironment[$0]!)")
+            }
+        }
+        parts += [shellQuote(executable)] + app.launchArguments(proxyURL: proxyURL).map(shellQuote)
+        let cmd = parts.joined(separator: " ")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(cmd, forType: .string)
         showToast("终端命令已复制")
@@ -456,7 +493,7 @@ final class AppState: ObservableObject {
         if url.pathExtension != "app" { url.appendPathExtension("app") }
 
         do {
-            try buildLauncherBundle(at: url, name: app.name, targetApp: app.path, execPath: execPath)
+            try buildLauncherBundle(at: url, app: app, execPath: execPath)
             showToast("已生成 \(url.lastPathComponent)")
             NSWorkspace.shared.activateFileViewerSelecting([url])
         } catch {
@@ -464,8 +501,11 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func buildLauncherBundle(at url: URL, name: String,
-                                     targetApp: String, execPath: String) throws {
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func buildLauncherBundle(at url: URL, app: ManagedApp, execPath: String) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
         let contents = url.appendingPathComponent("Contents")
@@ -504,27 +544,29 @@ final class AppState: ObservableObject {
 
         let script = """
         #!/bin/bash
-        # 由「代理启动器」生成：带代理环境变量启动 \(name)
+        # 由「代理启动器」生成
         # 代理地址从共享配置读取，在「代理启动器」里改设置后此启动器自动同步
         ENV_FILE="$HOME/Library/Application Support/ProxyLauncher/proxy.env"
         [ -f "$ENV_FILE" ] && . "$ENV_FILE"
         PROXY_URL="${PROXY_URL:-http://127.0.0.1:7890}"
         NO_PROXY_VALUE="${NO_PROXY_VALUE:-localhost,127.0.0.1,::1}"
+        \(app.injectProxyEnvironment ? """
         export HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL" ALL_PROXY="$PROXY_URL"
         export http_proxy="$PROXY_URL" https_proxy="$PROXY_URL" all_proxy="$PROXY_URL"
         export NO_PROXY="$NO_PROXY_VALUE" no_proxy="$NO_PROXY_VALUE"
-        TARGET="\(execPath)"
+        """ : "# 未启用代理环境变量注入")
+        TARGET=\(shellQuote(execPath))
         if [ ! -x "$TARGET" ]; then
-          osascript -e 'display alert "找不到目标应用" message "\(execPath)"' >/dev/null 2>&1
+          osascript -e 'display alert "找不到目标应用" message "请确认应用位置，并重新生成启动器。"' >/dev/null 2>&1
           exit 1
         fi
-        exec "$TARGET"
+        exec "$TARGET"\(app.chromiumProxyEnabled ? " \"--proxy-server=$PROXY_URL\"" : "")
         """
         let scriptURL = macos.appendingPathComponent("launcher")
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
 
-        writeIcon(of: targetApp, to: resources.appendingPathComponent("AppIcon.icns"))
+        writeIcon(of: app.path, to: resources.appendingPathComponent("AppIcon.icns"))
     }
 
     /// 把目标应用的图标复制/渲染成启动器的 icns
@@ -599,6 +641,9 @@ struct ContentView: View {
         .frame(minWidth: 500, minHeight: 560)
         .overlay(alignment: .bottom) { toastView }
         .overlay { dropOverlay }
+        .sheet(item: $state.launchSettingsSuggestion) { app in
+            AppLaunchSettings(state: state, app: app)
+        }
         .onDrop(of: [UTType.fileURL.identifier], isTargeted: $dropTargeted) { providers in
             handleDrop(providers)
         }
@@ -805,6 +850,7 @@ struct AppRow: View {
     @ObservedObject var state: AppState
     let app: ManagedApp
     @State private var hovering = false
+    @State private var showingSettings = false
 
     private var running: Bool { state.runningPaths.contains(app.path) }
 
@@ -817,6 +863,14 @@ struct AppRow: View {
                 HStack(spacing: 6) {
                     Text(app.name)
                         .fontWeight(.medium)
+                    if app.chromiumProxyEnabled {
+                        Text("Chromium 代理")
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.accentColor.opacity(0.12), in: Capsule())
+                            .foregroundColor(.accentColor)
+                    }
                     if running {
                         Text("运行中")
                             .font(.caption2)
@@ -841,6 +895,13 @@ struct AppRow: View {
                     .truncationMode(.middle)
             }
             Spacer()
+            Button {
+                showingSettings = true
+            } label: {
+                Image(systemName: "slider.horizontal.3")
+            }
+            .buttonStyle(.borderless)
+            .help("启动设置")
             if hovering {
                 Button {
                     state.generateLauncher(for: app)
@@ -872,7 +933,12 @@ struct AppRow: View {
         .padding(.vertical, 8)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
+        .sheet(isPresented: $showingSettings) {
+            AppLaunchSettings(state: state, app: app)
+        }
         .contextMenu {
+            Button("启动设置…") { showingSettings = true }
+            Divider()
             Button("带代理启动") { state.launch(app) }
             Button("生成独立启动器…") { state.generateLauncher(for: app) }
             Button("复制终端启动命令") { state.copyTerminalCommand(app) }
@@ -884,6 +950,97 @@ struct AppRow: View {
                 state.apps.removeAll { $0.id == app.id }
             }
         }
+    }
+}
+
+struct AppLaunchSettings: View {
+    @ObservedObject var state: AppState
+    let app: ManagedApp
+    @Environment(\.dismiss) private var dismiss
+    @State private var injectEnvironment: Bool
+    @State private var chromiumProxy: Bool
+
+    init(state: AppState, app: ManagedApp) {
+        self.state = state
+        self.app = app
+        _injectEnvironment = State(initialValue: app.injectProxyEnvironment)
+        _chromiumProxy = State(initialValue: app.chromiumProxyEnabled)
+    }
+
+    private var isChatGPT: Bool {
+        URL(fileURLWithPath: app.path).deletingPathExtension().lastPathComponent.lowercased() == "chatgpt"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack(spacing: 12) {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: app.path))
+                    .resizable().frame(width: 40, height: 40)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("启动设置").font(.title2.bold())
+                    Text(app.name).foregroundColor(.secondary)
+                }
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle("注入代理环境变量", isOn: $injectEnvironment)
+                Text("为支持 HTTP_PROXY、HTTPS_PROXY 等变量的应用及后台组件设置代理。")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle("Chromium 代理参数", isOn: $chromiumProxy)
+                Text("适用于支持此参数的 Electron / Chromium 应用；其它应用请保持关闭。")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            if isChatGPT {
+                Label("ChatGPT 建议同时启用这两项，以改善账号信息等页面的加载。", systemImage: "lightbulb")
+                    .font(.callout).foregroundColor(.secondary)
+                if !chromiumProxy || !injectEnvironment {
+                    Button("使用 ChatGPT 建议设置") {
+                        injectEnvironment = true
+                        chromiumProxy = true
+                    }
+                }
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("当前启动预览").font(.subheadline.bold())
+                Text("代理地址：\(state.proxyURL)")
+                if injectEnvironment {
+                    Text("HTTP_PROXY / HTTPS_PROXY / ALL_PROXY（含小写）\nNO_PROXY = \(state.noProxy)")
+                }
+                if chromiumProxy {
+                    Text("--proxy-server=\(state.proxyURL)").font(.system(.callout, design: .monospaced))
+                }
+                if !injectEnvironment && !chromiumProxy {
+                    Text("按默认方式启动，不额外设置代理。")
+                }
+            }
+            .font(.caption)
+            .textSelection(.enabled)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            Text("保存后，下次启动或重启应用时生效。已生成的独立启动器需要重新生成；仅修改代理地址无需重新生成。")
+                .font(.caption).foregroundColor(.secondary)
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("保存") {
+                    if let index = state.apps.firstIndex(where: { $0.id == app.id }) {
+                        var updated = state.apps[index]
+                        updated.injectProxyEnvironment = injectEnvironment
+                        updated.chromiumProxyEnabled = chromiumProxy
+                        state.apps[index] = updated
+                        state.showToast("启动设置已保存，下次启动时生效")
+                    }
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 470)
     }
 }
 
