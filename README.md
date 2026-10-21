@@ -11,25 +11,26 @@
 ## 下载安装
 
 从 [Releases](https://github.com/ZhjGo/ProxyLauncher/releases) 下载最新的
-`ProxyLauncher-x.x.zip`，解压后把 `代理启动器.app` 拖进「应用程序」文件夹。
-当前源码构建 Apple Silicon（arm64）版本，需要 macOS 13 或更高。
+`ProxyLauncher-x.x.zip`，解压后把 `ProxyLauncher.app` 拖进「应用程序」文件夹
+（显示名称是「代理启动器」）。当前源码构建 Apple Silicon（arm64）版本，
+需要 macOS 13 或更高。
 
 **首次打开**：本应用没有 Apple 开发者签名，直接双击会提示"无法验证开发者"。
 解决方法（任选其一）：
 
 - 打开「系统设置 → 隐私与安全性」，在底部找到被拦截的提示，点「仍要打开」；
-- 或在终端执行：`xattr -cr /Applications/代理启动器.app`，之后正常双击即可。
+- 或在终端执行：`xattr -cr /Applications/ProxyLauncher.app`，之后正常双击即可。
 
 不想用现成包的话，克隆仓库跑 `./build.sh` 自己构建（只需 Xcode 命令行工具）。
 
 ## 使用
 
 1. 先打开 Clash Verge 等代理软件（默认混合端口 7890）。
-2. 双击 `dist/代理启动器.app` 打开。顶部绿点表示代理端口已连通。
+2. 双击 `dist/ProxyLauncher.app` 打开。顶部绿点表示代理端口已连通。
 3. 点「添加应用」或**直接把 App 拖进窗口**添加（可多选）。
 4. 点某个应用的「启动」即可带代理启动。若该应用已在运行，会提示「退出并重新启动」
    （环境变量只在启动那一刻生效）；若代理端口不通，会先提醒。
-5. 建议把 `代理启动器.app` 拖进「应用程序」文件夹，方便从启动台打开。
+5. 建议把 `ProxyLauncher.app` 拖进「应用程序」文件夹，方便从启动台打开。
 
 ### 每个应用的启动设置
 
@@ -53,6 +54,8 @@ ChatGPT 的设置页提供「使用 ChatGPT 建议设置」，同时开启以上
   用原应用图标，放进 Dock / 启动台后**双击即带代理启动**，不用先开本工具。
   启动器从 `~/Library/Application Support/ProxyLauncher/proxy.env` 读取代理地址，
   在主界面改了设置后所有启动器自动同步，无需重新生成。
+  启动器是原生可执行文件（不是脚本），并已 ad-hoc 签名，
+  在 Apple Silicon 上双击不会再提示「需要安装 Rosetta」。
 - **测出口**：经代理查询出口 IP、国家/城市和运营商，快速判断节点地区是否符合要求
   （如「当前地区不支持」类报错）。依次尝试 ipwho.is / api.ip.sb / ip-api.com，
   单个接口限流会自动换下一个。
@@ -69,14 +72,15 @@ ChatGPT 的设置页提供「使用 ChatGPT 建议设置」，同时开启以上
 ## 重新构建
 
 ```bash
-./build.sh        # 产物在 dist/代理启动器.app，另生成带版本号的 arm64 ZIP 安装包
+./build.sh        # 产物在 dist/ProxyLauncher.app，另生成带版本号的 arm64 ZIP 安装包
 ```
 
 只需要 Xcode Command Line Tools（swiftc），不需要完整 Xcode。
 
 ## 文件说明
 
-- `Sources/main.swift` — 全部应用代码（SwiftUI）
+- `Sources/main.swift` — 主应用代码（SwiftUI）
+- `Sources/LauncherStub.swift` — 独立启动器的原生可执行文件（生成启动器时复制进去）
 - `Info.plist` — 应用包信息
 - `make-icon.swift` — 构建时生成图标
 - `build.sh` — 编译 + 打包 + ad-hoc 签名
@@ -85,3 +89,6 @@ ChatGPT 的设置页提供「使用 ChatGPT 建议设置」，同时开启以上
 
 - 目标应用更新后路径不变，启动器继续可用；若应用被移动/改名，需重新生成启动器。
 - 代理环境变量只对「从本工具或启动器启动」的进程生效，从 Dock 直接打开不走代理。
+- 主程序和生成的独立启动器都只针对 Apple Silicon（arm64）；拷到 Intel Mac 上无法运行。
+- 早期版本生成的启动器内部是 shell 脚本，在 Apple Silicon 上双击会提示「需要安装 Rosetta」，
+  用新版本重新生成即可。

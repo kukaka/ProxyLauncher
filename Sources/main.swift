@@ -521,9 +521,9 @@ final class AppState: ObservableObject {
         <plist version="1.0">
         <dict>
         \t<key>CFBundleName</key>
-        \t<string>\(displayName)</string>
+        \t<string>\(xmlEscape(displayName))</string>
         \t<key>CFBundleDisplayName</key>
-        \t<string>\(displayName)</string>
+        \t<string>\(xmlEscape(displayName))</string>
         \t<key>CFBundleExecutable</key>
         \t<string>launcher</string>
         \t<key>CFBundleIdentifier</key>
@@ -536,37 +536,54 @@ final class AppState: ObservableObject {
         \t<string>AppIcon</string>
         \t<key>NSHighResolutionCapable</key>
         \t<true/>
+        \t<key>PLTargetPath</key>
+        \t<string>\(xmlEscape(execPath))</string>
+        \t<key>PLInjectEnv</key>
+        \t<\(app.injectProxyEnvironment ? "true" : "false")/>
+        \t<key>PLChromiumProxy</key>
+        \t<\(app.chromiumProxyEnabled ? "true" : "false")/>
         </dict>
         </plist>
         """
         try plist.write(to: contents.appendingPathComponent("Info.plist"),
                         atomically: true, encoding: .utf8)
 
-        let script = """
-        #!/bin/bash
-        # 由「代理启动器」生成
-        # 代理地址从共享配置读取，在「代理启动器」里改设置后此启动器自动同步
-        ENV_FILE="$HOME/Library/Application Support/ProxyLauncher/proxy.env"
-        [ -f "$ENV_FILE" ] && . "$ENV_FILE"
-        PROXY_URL="${PROXY_URL:-http://127.0.0.1:7890}"
-        NO_PROXY_VALUE="${NO_PROXY_VALUE:-localhost,127.0.0.1,::1}"
-        \(app.injectProxyEnvironment ? """
-        export HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL" ALL_PROXY="$PROXY_URL"
-        export http_proxy="$PROXY_URL" https_proxy="$PROXY_URL" all_proxy="$PROXY_URL"
-        export NO_PROXY="$NO_PROXY_VALUE" no_proxy="$NO_PROXY_VALUE"
-        """ : "# 未启用代理环境变量注入")
-        TARGET=\(shellQuote(execPath))
-        if [ ! -x "$TARGET" ]; then
-          osascript -e 'display alert "找不到目标应用" message "请确认应用位置，并重新生成启动器。"' >/dev/null 2>&1
-          exit 1
-        fi
-        exec "$TARGET"\(app.chromiumProxyEnabled ? " \"--proxy-server=$PROXY_URL\"" : "")
-        """
-        let scriptURL = macos.appendingPathComponent("launcher")
-        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        // 可执行文件必须是原生 Mach-O：如果放的是 shell 脚本，Apple Silicon 上的
+        // Launch Services 判定不了架构，会提示「需要安装 Rosetta」才能打开。
+        let stub = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Resources/launcher-stub")
+        guard fm.fileExists(atPath: stub.path) else {
+            throw NSError(domain: "ProxyLauncher", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "缺少启动器组件 launcher-stub，请重新安装本应用",
+            ])
+        }
+        let executable = macos.appendingPathComponent("launcher")
+        try fm.copyItem(at: stub, to: executable)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
 
         writeIcon(of: app.path, to: resources.appendingPathComponent("AppIcon.icns"))
+
+        // ad-hoc 签名，避免 Gatekeeper 拦截
+        signBundle(at: url)
+    }
+
+    /// XML 文本转义：应用名或路径里带 & < > 时不会写出非法 plist
+    private func xmlEscape(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+    }
+
+    /// 对生成的启动器做 ad-hoc 签名（本机自签，不需要开发者证书）
+    private func signBundle(at url: URL) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        process.arguments = ["--force", "--sign", "-", url.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
     }
 
     /// 把目标应用的图标复制/渲染成启动器的 icns

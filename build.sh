@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME="代理启动器"
+APP_NAME="ProxyLauncher"
 BUILD=build
 APP="dist/${APP_NAME}.app"
 
@@ -15,6 +15,12 @@ swiftc -O -swift-version 5 -parse-as-library \
     -target arm64-apple-macos13 \
     -o "$APP/Contents/MacOS/ProxyLauncher" \
     Sources/main.swift
+
+echo "==> 编译独立启动器组件（原生可执行文件）"
+swiftc -O -swift-version 5 -parse-as-library \
+    -target arm64-apple-macos13 \
+    -o "$APP/Contents/Resources/launcher-stub" \
+    Sources/LauncherStub.swift
 
 echo "==> 生成图标"
 swift make-icon.swift "$BUILD/icon-1024.png"
