@@ -26,8 +26,11 @@ struct ManagedApp: Identifiable, Codable, Equatable {
         chromiumProxyEnabled = try values.decodeIfPresent(Bool.self, forKey: .chromiumProxyEnabled) ?? false
     }
 
+    /// 启动参数：Chromium 系应用可以用 --proxy-server 指定代理
     func launchArguments(proxyURL: String) -> [String] {
-        chromiumProxyEnabled ? ["--proxy-server=\(proxyURL)"] : []
+        var args: [String] = []
+        if chromiumProxyEnabled { args.append("--proxy-server=\(proxyURL)") }
+        return args
     }
 
     var name: String {
@@ -49,6 +52,13 @@ final class AppState: ObservableObject {
     @Published var apps: [ManagedApp] { didSet { save() } }
     @Published var menuBarEnabled: Bool { didSet { save() } }
 
+    /// 抖音「高画质模式」总开关：启动抖音时改用打了补丁的副本
+    @Published var douyinHighQuality: Bool { didSet { save(); refreshHQStatus() } }
+    /// 副本状态（最新 / 需重建 / 未制作…）
+    @Published var hqStatus: DouyinHQ.Status = .notBuilt
+    /// 正在制作 / 更新副本
+    @Published var hqBusy = false
+
     /// nil = 检测中, true/false = 端口是否可连
     @Published var portReachable: Bool? = nil
     @Published var runningPaths: Set<String> = []
@@ -65,6 +75,7 @@ final class AppState: ObservableObject {
         port = defaults.string(forKey: "port") ?? "7890"
         noProxy = defaults.string(forKey: "noProxy") ?? "localhost,127.0.0.1,::1"
         menuBarEnabled = defaults.bool(forKey: "menuBar")
+        douyinHighQuality = defaults.bool(forKey: "douyinHighQuality")
         if let data = defaults.data(forKey: "apps"),
            let list = try? JSONDecoder().decode([ManagedApp].self, from: data) {
             apps = list
@@ -74,6 +85,7 @@ final class AppState: ObservableObject {
         writeEnvFile()
         checkPort()
         refreshRunning()
+        refreshHQStatus()
         // 每 2 秒刷新运行状态；每 6 秒复查端口，断开时自动探测切换
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.periodicTick()
@@ -101,6 +113,7 @@ final class AppState: ObservableObject {
         defaults.set(port, forKey: "port")
         defaults.set(noProxy, forKey: "noProxy")
         defaults.set(menuBarEnabled, forKey: "menuBar")
+        defaults.set(douyinHighQuality, forKey: "douyinHighQuality")
         if let data = try? JSONEncoder().encode(apps) {
             defaults.set(data, forKey: "apps")
         }
@@ -343,7 +356,22 @@ final class AppState: ObservableObject {
     }
 
     func isRunning(_ app: ManagedApp) -> NSRunningApplication? {
-        NSWorkspace.shared.runningApplications.first { $0.bundleURL?.path == app.path }
+        // 高画质模式下跑的是副本，进程路径是副本的路径
+        for path in launchPaths(for: app) {
+            if let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleURL?.path == path }) {
+                return running
+            }
+        }
+        return nil
+    }
+
+    /// 启动某个应用时实际会用到的路径：抖音高画质开启时是副本，否则是原版
+    func launchPaths(for app: ManagedApp) -> [String] {
+        if douyinHighQuality, DouyinHQ.isDouyin(at: app.path),
+           FileManager.default.fileExists(atPath: DouyinHQ.copyURL.path) {
+            return [DouyinHQ.copyURL.path, app.path]
+        }
+        return [app.path]
     }
 
     // MARK: 添加 / 启动
@@ -431,37 +459,108 @@ final class AppState: ObservableObject {
             showToast("找不到 \(app.path)，应用可能已被移动或删除")
             return
         }
+        // 抖音高画质模式：改用打了补丁的副本启动
+        if douyinHighQuality, DouyinHQ.isDouyin(at: app.path) {
+            launchDouyinHQ(app)
+            return
+        }
+        open(app, at: URL(fileURLWithPath: app.path))
+    }
+
+    /// 启动抖音的高画质副本。副本不存在时先在后台制作一份。
+    private func launchDouyinHQ(_ app: ManagedApp) {
+        let copy = DouyinHQ.copyURL
+        guard FileManager.default.fileExists(atPath: copy.path) else {
+            hqBusy = true
+            showToast("正在制作高画质副本…")
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                do {
+                    try DouyinHQ.build { message in
+                        DispatchQueue.main.async { self?.showToast(message) }
+                    }
+                    DispatchQueue.main.async {
+                        self?.hqBusy = false
+                        self?.refreshHQStatus()
+                        self?.open(app, at: copy)
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self?.hqBusy = false
+                        self?.showAlert("高画质副本制作失败",
+                                        error.localizedDescription + "\n\n将按原版启动抖音。")
+                        self?.open(app, at: URL(fileURLWithPath: app.path))
+                    }
+                }
+            }
+            return
+        }
+        if case .outdated = hqStatus {
+            showToast("副本落后于原版，建议更新")
+        }
+        open(app, at: copy)
+    }
+
+    /// 用给定的路径启动应用（带代理设置）
+    private func open(_ app: ManagedApp, at url: URL) {
+        // 副本和原版 bundle ID 相同，不能同时运行；原版在跑的话先让用户退掉
+        if url.path == DouyinHQ.copyURL.path,
+           runningPaths.contains(app.path) {
+            showAlert("请先退出原版抖音",
+                      "高画质副本和原版的应用标识相同，不能同时运行。\n"
+                      + "请先完全退出原版抖音，再启动副本。")
+            return
+        }
         let config = NSWorkspace.OpenConfiguration()
         var env = ProcessInfo.processInfo.environment
         if app.injectProxyEnvironment {
             proxyEnvironment.forEach { env[$0] = $1 }
         }
+        if url.path == DouyinHQ.copyURL.path {
+            // 高画质补丁默认生效；留着这个开关是为了将来做对照实验
+            env["PROXYLAUNCHER_H266_TEST"] = "1"
+            // 副本沿用原版授权（本来就有 allow-dyld-environment-variables），
+            // 环境里残留 DYLD_INSERT_LIBRARIES 会把 dylib 塞进子进程，
+            // 历史症状是界面一直停在「加载中」，这里清掉。
+            // 注意要先收集键再删：边遍历边改字典会崩溃。
+            let dyldKeys = env.keys.filter { $0.hasPrefix("DYLD_") }
+            for key in dyldKeys {
+                env.removeValue(forKey: key)
+            }
+        }
         config.environment = env
         config.arguments = app.launchArguments(proxyURL: proxyURL)
         config.createsNewApplicationInstance = false
         let name = app.name
-        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: app.path),
-                                           configuration: config) { [weak self] _, error in
+        let isHQ = url.path == DouyinHQ.copyURL.path
+        NSWorkspace.shared.openApplication(at: url, configuration: config) { [weak self] _, error in
             DispatchQueue.main.async {
                 if let error {
                     self?.showToast("启动 \(name) 失败：\(error.localizedDescription)")
                 } else {
-                    self?.showToast("已带代理启动 \(name)")
                     self?.refreshRunning()
+                    self?.showToast(isHQ ? "已带代理启动 \(name)（高画质副本）" : "已带代理启动 \(name)")
                 }
             }
         }
     }
 
     func copyTerminalCommand(_ app: ManagedApp) {
-        guard let executable = Bundle(path: app.path)?.executableURL?.path else {
+        let target = launchPaths(for: app).first ?? app.path
+        guard let executable = Bundle(path: target)?.executableURL?.path else {
             showToast("读取应用启动信息失败")
             return
         }
         var parts: [String] = []
+        var envVars: [String: String] = [:]
         if app.injectProxyEnvironment {
-            parts = ["env"] + proxyEnvironment.keys.sorted().map {
-                shellQuote("\($0)=\(proxyEnvironment[$0]!)")
+            envVars.merge(proxyEnvironment) { _, new in new }
+        }
+        if target == DouyinHQ.copyURL.path {
+            envVars["PROXYLAUNCHER_H266_TEST"] = "1"
+        }
+        if !envVars.isEmpty {
+            parts = ["env"] + envVars.keys.sorted().map {
+                shellQuote("\($0)=\(envVars[$0]!)")
             }
         }
         parts += [shellQuote(executable)] + app.launchArguments(proxyURL: proxyURL).map(shellQuote)
@@ -471,15 +570,77 @@ final class AppState: ObservableObject {
         showToast("终端命令已复制")
     }
 
+    // MARK: 抖音高画质模式
+
+    /// 刷新副本状态（界面显示用）
+    func refreshHQStatus() {
+        let newStatus = DouyinHQ.status
+        if newStatus != hqStatus { hqStatus = newStatus }
+    }
+
+    /// 制作 / 更新副本
+    func updateDouyinHQ() {
+        guard !hqBusy else { return }
+        hqBusy = true
+        showToast("正在制作高画质副本…")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try DouyinHQ.build { message in
+                    DispatchQueue.main.async { self?.showToast(message) }
+                }
+                DispatchQueue.main.async {
+                    self?.hqBusy = false
+                    self?.refreshHQStatus()
+                    self?.showToast("高画质副本已就绪")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.hqBusy = false
+                    self?.showAlert("高画质副本制作失败", error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// 删除副本（不动原版）
+    func removeDouyinHQ() {
+        guard !hqBusy else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "删除高画质副本？"
+        alert.informativeText = "只删除本工具制作的副本，原版抖音不会被修改。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        hqBusy = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try DouyinHQ.removeCopy()
+                DispatchQueue.main.async {
+                    self?.hqBusy = false
+                    self?.refreshHQStatus()
+                    self?.showToast("已删除高画质副本")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.hqBusy = false
+                    self?.showAlert("删除失败", error.localizedDescription)
+                }
+            }
+        }
+    }
+
     // MARK: 生成独立启动器
 
     func generateLauncher(for app: ManagedApp) {
-        guard let bundle = Bundle(path: app.path),
+        // 抖音高画质模式下，启动器指向的是打了补丁的副本
+        let targetPath = launchPaths(for: app).first ?? app.path
+        guard let bundle = Bundle(path: targetPath),
               let execName = bundle.infoDictionary?["CFBundleExecutable"] as? String else {
             showToast("读取 \(app.name) 的启动信息失败")
             return
         }
-        let execPath = app.path + "/Contents/MacOS/" + execName
+        let execPath = targetPath + "/Contents/MacOS/" + execName
 
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSSavePanel()
@@ -515,6 +676,8 @@ final class AppState: ObservableObject {
         try fm.createDirectory(at: resources, withIntermediateDirectories: true)
 
         let displayName = url.deletingPathExtension().lastPathComponent
+        // 抖音高画质副本：启动器要带上开关，副本里的补丁才会生效
+        let isHighQuality = execPath.hasPrefix(DouyinHQ.copyURL.path)
         let plist = """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -542,6 +705,8 @@ final class AppState: ObservableObject {
         \t<\(app.injectProxyEnvironment ? "true" : "false")/>
         \t<key>PLChromiumProxy</key>
         \t<\(app.chromiumProxyEnabled ? "true" : "false")/>
+        \t<key>PLHighQuality</key>
+        \t<\(isHighQuality ? "true" : "false")/>
         </dict>
         </plist>
         """
@@ -561,6 +726,7 @@ final class AppState: ObservableObject {
         try fm.copyItem(at: stub, to: executable)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
 
+        // 图标
         writeIcon(of: app.path, to: resources.appendingPathComponent("AppIcon.icns"))
 
         // ad-hoc 签名，避免 Gatekeeper 拦截
@@ -579,7 +745,8 @@ final class AppState: ObservableObject {
     private func signBundle(at url: URL) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        process.arguments = ["--force", "--sign", "-", url.path]
+        // --deep：把 bundle 里的硬件伪装 dylib 一起签掉，否则校验会失败
+        process.arguments = ["--force", "--deep", "--sign", "-", url.path]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try? process.run()
@@ -632,6 +799,16 @@ final class AppState: ObservableObject {
 
     private var toastWork: DispatchWorkItem?
 
+    /// 需要用户确认的提示
+    func showAlert(_ title: String, _ message: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
     func showToast(_ text: String) {
         toast = text
         toastWork?.cancel()
@@ -652,6 +829,8 @@ struct ContentView: View {
             proxySection
             Divider()
             appListSection
+            Divider()
+            douyinSection
             Divider()
             bottomBar
         }
@@ -782,6 +961,62 @@ struct ContentView: View {
         .frame(maxHeight: .infinity)
     }
 
+    // 抖音高画质区
+
+    private var douyinHint: String {
+        "抖音客户端会优先播放 H.266 码流，而这个视频的 H.266 最高只有 720P，"
+        + "于是 4K / 2K 档位被藏起来了。开启后会在隔离副本里关掉 H.266 能力检测，"
+        + "客户端就会改走 H.265，服务端早就下发好的 4K 码流就能用上。原版应用不会被修改。"
+    }
+
+    private var douyinSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("抖音高画质", systemImage: "4k.tv")
+                    .font(.headline)
+                Spacer()
+                Text(state.hqStatus.text)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Toggle("启动抖音时使用高画质副本", isOn: $state.douyinHighQuality)
+                .toggleStyle(.checkbox)
+                .help("在隔离副本里关掉 H.266 能力检测，恢复 2K / 4K 档位")
+            Text(douyinHint)
+                .font(.caption).foregroundColor(.secondary)
+            if !state.apps.contains(where: { DouyinHQ.isDouyin(at: $0.path) }) {
+                Text("把抖音加入应用列表后，点它那一行的「启动」就会用副本启动。")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            HStack(spacing: 8) {
+                Button {
+                    state.updateDouyinHQ()
+                } label: {
+                    Label("制作 / 更新副本", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(state.hqBusy)
+                Button {
+                    state.removeDouyinHQ()
+                } label: {
+                    Label("删除副本", systemImage: "trash")
+                }
+                .disabled(state.hqBusy)
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([DouyinHQ.copyURL])
+                } label: {
+                    Label("在访达中显示", systemImage: "folder")
+                }
+                .disabled(!FileManager.default.fileExists(atPath: DouyinHQ.copyURL.path))
+                if state.hqBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Spacer()
+            }
+            .font(.callout)
+        }
+        .padding(16)
+    }
+
     private var bottomBar: some View {
         HStack(spacing: 10) {
             Button {
@@ -797,11 +1032,30 @@ struct ContentView: View {
             .disabled(state.apps.isEmpty)
             .help("带代理启动列表里所有未运行的应用")
             Spacer()
+            buildBadge
             Toggle("菜单栏常驻", isOn: $state.menuBarEnabled)
                 .toggleStyle(.checkbox)
                 .help("在菜单栏显示图标，关掉窗口后仍可从菜单栏一键启动")
         }
         .padding(12)
+    }
+
+    /// 构建号：build.sh 每次构建都会自增并写进 Info.plist，
+    /// 界面上显示出来，一眼就能确认「我现在跑的是哪一版」。
+    private var buildBadge: some View {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let number = info["PLBuildNumber"] as? String ?? "?"
+        let time = info["PLBuildTime"] as? String ?? ""
+        let text = time.isEmpty ? "构建 #\(number)" : "构建 #\(number) · \(time)"
+        return Text(text)
+            .font(.caption)
+            .foregroundColor(.secondary)
+            .help("当前构建版本（点击可复制）")
+            .onTapGesture {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString("ProxyLauncher build #\(number) · \(time)",
+                                              forType: .string)
+            }
     }
 
     // 拖拽
@@ -887,6 +1141,15 @@ struct AppRow: View {
                             .padding(.vertical, 1)
                             .background(Color.accentColor.opacity(0.12), in: Capsule())
                             .foregroundColor(.accentColor)
+                    }
+                    if state.douyinHighQuality && DouyinHQ.isDouyin(at: app.path) {
+                        Text("高画质")
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.purple.opacity(0.15), in: Capsule())
+                            .foregroundColor(.purple)
+                            .help("启动时使用打了画质补丁的抖音副本（2K / 4K 档位）")
                     }
                     if running {
                         Text("运行中")
@@ -988,6 +1251,10 @@ struct AppLaunchSettings: View {
         URL(fileURLWithPath: app.path).deletingPathExtension().lastPathComponent.lowercased() == "chatgpt"
     }
 
+    private var isDouyin: Bool {
+        DouyinHQ.isDouyin(at: app.path)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             HStack(spacing: 12) {
@@ -1019,10 +1286,20 @@ struct AppLaunchSettings: View {
                     }
                 }
             }
+            if isDouyin {
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("抖音高画质模式在主窗口里开关。", systemImage: "4k.tv")
+                        .font(.callout).foregroundColor(.secondary)
+                    Text("开启后会用打了补丁的副本启动抖音，2K / 4K 档位才会出现。"
+                         + "副本由主窗口的「抖音高画质」区域制作和管理，原版应用不会被修改。")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
             VStack(alignment: .leading, spacing: 8) {
                 Text("当前启动预览").font(.subheadline.bold())
-                Text("代理地址：\(state.proxyURL)")
                 if injectEnvironment {
+                    Text("代理地址：\(state.proxyURL)")
                     Text("HTTP_PROXY / HTTPS_PROXY / ALL_PROXY（含小写）\nNO_PROXY = \(state.noProxy)")
                 }
                 if chromiumProxy {
@@ -1126,6 +1403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct ProxyLauncherApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var state = AppState.shared
+
 
     var body: some Scene {
         Window("代理启动器", id: "main") {

@@ -66,8 +66,35 @@ ChatGPT 的设置页提供「使用 ChatGPT 建议设置」，同时开启以上
 - **菜单栏常驻**：勾选后菜单栏出现 ✈️ 图标，关掉窗口不退出、从 Dock 隐藏，
   随时从菜单栏一键启动任意应用。
 - **全部启动**：一键带代理启动列表里所有未运行的应用。
+- **抖音高画质**：可选让抖音客户端显示并播放 2K / 4K 档位。详见下方「抖音高画质」。
 - 右键应用行：带代理启动、生成启动器、复制等效终端命令、在访达中显示、移除。
 - 所有设置自动保存；只影响由本工具（或生成的启动器）启动的应用，不修改系统全局代理。
+
+## 抖音高画质（2K / 4K 档位）
+
+抖音 PC 客户端会**优先播放 H.266 码流**，而它拿到的 H.266 最高只有 720P，
+于是 2K / 4K 档位在客户端被藏了起来 —— 服务端其实早就把 4K 的 H.265 码流发下来了。
+
+主窗口底部的「抖音高画质」区域：
+
+- 勾选「启动抖音时使用高画质副本」→ 之后从本工具启动抖音会改用副本。
+- 「制作 / 更新副本」→ 在 `~/Library/Application Support/ProxyLauncher/apps/Douyin-HQ.app`
+  生成一份打了补丁的副本（APFS 克隆，几乎不额外占磁盘），**原版应用不会被修改**。
+- 「删除副本」→ 删掉副本，同样不碰原版。
+
+原理：补丁让网页里的 `MediaSource.isTypeSupported("...bvc2...")` 返回 false，
+客户端就会改走 H.265 分支，用上服务端早就下发好的 4K 码流。
+**跟硬件信息没有关系**（真实 8 核同样能出 4K）。
+
+注意事项：
+
+- 副本与原版的应用标识相同，**不能同时运行**，启动副本前请先退出原版抖音。
+- 首次运行副本时 macOS 会弹一次钥匙串授权，点「Always Allow」即可，之后不再弹。
+- 抖音更新后副本会落后，界面会提示「制作 / 更新副本」。
+- 副本是 ad-hoc 签名，从此不再播放 H.266 码流（目前 H.266 最高只有 720P，所以是净收益）。
+
+完整调查过程与证据见 [NOTES-抖音4K画质.md](docs/NOTES-抖音4K画质.md)，
+使用说明见 [NOTES-抖音高画质模式.md](docs/NOTES-抖音高画质模式.md)。
 
 ## 重新构建
 
@@ -75,15 +102,24 @@ ChatGPT 的设置页提供「使用 ChatGPT 建议设置」，同时开启以上
 ./build.sh        # 产物在 dist/ProxyLauncher.app，另生成带版本号的 arm64 ZIP 安装包
 ```
 
-只需要 Xcode Command Line Tools（swiftc），不需要完整 Xcode。
+只需要 `swiftc`（Xcode Command Line Tools 即可），不需要完整 Xcode。
+
+个别机器上 Command Line Tools 与它附带的 macOS SDK 版本对不上，编译会报
+`this SDK is not supported by the compiler`（或 `redefinition of module 'SwiftBridging'`）。
+`build.sh` 会自动探测这种情况，并在 `~/Library/Caches/proxylauncher-toolchain`
+生成一份"影子工具链"绕过去，不改系统文件、也不需要管理员权限。
+彻底解决请安装完整 Xcode——Xcode 的 SDK 自带二进制模块，不会出现该报错。
 
 ## 文件说明
 
 - `Sources/main.swift` — 主应用代码（SwiftUI）
 - `Sources/LauncherStub.swift` — 独立启动器的原生可执行文件（生成启动器时复制进去）
+- `Sources/DouyinHighQuality.swift` — 抖音高画质：克隆副本、改写 `app.asar`、重签名
+- `Sources/douyin-hq-preload.js` — 注入副本 `app.asar` 的画质补丁源码
 - `Info.plist` — 应用包信息
 - `make-icon.swift` — 构建时生成图标
 - `build.sh` — 编译 + 打包 + ad-hoc 签名
+- `tools/prepare-toolchain.sh` — 探测工具链与 SDK 是否匹配，必要时准备影子工具链
 
 ## 注意
 
