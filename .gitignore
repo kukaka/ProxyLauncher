@@ -4,3 +4,6 @@ dist/
 
 # macOS
 .DS_Store
+
+# 构建号（每次构建自增，属于本地产物）
+BUILD_NUMBER

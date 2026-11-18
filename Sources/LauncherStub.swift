@@ -7,6 +7,7 @@ import Foundation
 //   PLTargetPath      目标应用的可执行文件路径
 //   PLInjectEnv       是否注入代理环境变量
 //   PLChromiumProxy   是否附加 --proxy-server 参数
+//   PLHighQuality     目标是不是抖音高画质副本（要打开画质补丁）
 // 代理地址在运行时从共享配置读取，改设置后无需重新生成启动器。
 //
 // 这里必须用原生可执行文件：如果 Contents/MacOS 里放的是 shell 脚本，
@@ -24,6 +25,7 @@ struct LauncherStub {
         }
         let injectEnv = info["PLInjectEnv"] as? Bool ?? true
         let chromiumProxy = info["PLChromiumProxy"] as? Bool ?? false
+        let highQuality = info["PLHighQuality"] as? Bool ?? false
 
         let env = readEnvFile()
         let proxyURL = env["PROXY_URL"] ?? "http://127.0.0.1:7890"
@@ -36,6 +38,17 @@ struct LauncherStub {
             setenv("NO_PROXY", noProxy, 1)
             setenv("no_proxy", noProxy, 1)
         }
+
+        // 抖音高画质副本：打开画质补丁，并清掉环境里可能残留的 DYLD_*
+        // （副本沿用原版授权，残留的 DYLD_INSERT_LIBRARIES 会把 dylib 塞进
+        //  子进程，历史症状是界面一直停在「加载中」）
+        if highQuality {
+            setenv("PROXYLAUNCHER_H266_TEST", "1", 1)
+            unsetenv("DYLD_INSERT_LIBRARIES")
+            unsetenv("DYLD_LIBRARY_PATH")
+            unsetenv("DYLD_FRAMEWORK_PATH")
+        }
+
 
         guard FileManager.default.isExecutableFile(atPath: target) else {
             alert("找不到目标应用", "请确认应用位置，并重新生成启动器。")
